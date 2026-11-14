@@ -307,6 +307,7 @@ bool Renderer::draw(SharedFrame& frame, std::pair<int, int> cursor_position, boo
         check(list_->Close()); ID3D12CommandList* lists[]{list_.Get()}; queue_->ExecuteCommandLists(1, lists);
         // 已提交的预览资源即使 Signal 失败也不能按旧 fence 提前释放；后续成功信号或设备移除才可回收。
         command_frame->fence = ++fence_value_;check(queue_->Signal(fence_.Get(), fence_value_));
+        displayed_panel_ = {panel_client, int(frame_width_), int(frame_height_)};
         ++stats_.draw_calls;
         return true;
     } catch (const std::exception& error) { last_error_ = error.what(); return false; }
@@ -331,7 +332,7 @@ void Renderer::reset() {
     slots_.clear(); texture_.Reset(); pipeline_.Reset(); root_.Reset(); list_.Reset(); fence_.Reset(); wait_event_.reset();
     command_frames_.clear(); command_frame_index_ = 0;
     rtv_.Reset(); srv_.Reset(); swapchain_.Reset(); queue_.Reset(); device_.Reset();
-    sequence_ = 0; fence_value_ = 0; uploaded_ = false; frame_viewport_generation_ = 1;
+    invalidate_frame(); fence_value_ = 0; frame_viewport_generation_ = 1;
     displayed_content_aspect_ = target_content_aspect_ = float(panel_width) / panel_height; stats_ = {}; window_ = nullptr;
 }
 }

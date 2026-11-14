@@ -102,6 +102,8 @@ struct Runtime {
     std::atomic_bool panel_dragging{};
     // 面板几何的写入来自窗口线程，读取来自 Present 线程；用同一把锁提交完整矩形，避免单轴调整读到中间状态。
     std::mutex panel_geometry_mutex;
+    DisplayedPanel displayed_panel;
+    std::atomic_int client_height_in_viewport_pixels{};
     // IPC 写入、窗口线程读取；和面板几何共用锁，避免折叠时命中旧的固定标题高度。
     WindowRegions window_regions;
     // W2 尺寸调整状态；输入线程写入请求，Present 线程负责裁剪并提交显示矩形。
@@ -386,16 +388,8 @@ void synchronize_virtual_cursor_position(HWND window) {
 
 // 把游戏客户区位置换算为固定浏览器逻辑坐标。面板外移动不交给网页命中测试，但仍绘制原生虚拟光标。
 bool map_virtual_cursor_to_panel(int x, int y, int& panel_x, int& panel_y) {
-    const int left = runtime->left.load();
-    const int top = runtime->top.load();
-    const int right = runtime->right.load();
-    const int bottom = runtime->bottom.load();
-    if (right <= left || bottom <= top || x < left || x >= right || y < top || y >= bottom) return false;
-    const auto viewport = runtime->viewport.snapshot();
-    const int content_width = std::max(1, viewport.width), content_height = std::max(1, viewport.height);
-    panel_x = std::clamp((x - left) * content_width / (right - left), 0, content_width - 1);
-    panel_y = std::clamp((y - top) * content_height / (bottom - top), 0, content_height - 1);
-    return true;
+    std::lock_guard lock(runtime->panel_geometry_mutex);
+    return runtime->displayed_panel.map_point(x, y, panel_x, panel_y);
 }
 
 // 仅在进入、离开或面板内移动时发送浏览器鼠标事件。浏览器 不再绘制指针，原生渲染器负责全客户区视觉光标。
@@ -427,8 +421,9 @@ void dispatch_virtual_cursor_move(int modifiers) {
 bool begin_panel_drag(int x, int y) {
     std::lock_guard geometry_lock(runtime->panel_geometry_mutex);
     const int left = runtime->left.load(), top = runtime->top.load();
-    const int right = runtime->right.load(), bottom = runtime->bottom.load();
-    if (!runtime->window_regions.contains(x-left,y-top,right-left,bottom-top)) return false;
+    const RECT bounds = runtime->displayed_panel.bounds;
+    if (!runtime->window_regions.contains(x - bounds.left, y - bounds.top,
+                                          bounds.right - bounds.left, bounds.bottom - bounds.top)) return false;
     runtime->panel_dragging = true;
     // 命中测试已使用当前已绘制矩形；从此刻起位置由拖动状态拥有，避免首帧初始化覆盖拖动坐标。
     runtime->panel_position_initialized.store(true, std::memory_order_release);
@@ -669,12 +664,15 @@ std::optional<std::tuple<UINT, WPARAM, LPARAM>> translate_raw_keyboard(const RAW
 
 // 把网页面板逻辑像素换算成游戏客户区像素；所有坐标在游戏窗口线程使用前再次裁剪。
 void map_ime_bounds(Json& value) {
-    const int panel_left = runtime->left.load();
-    const int panel_top = runtime->top.load();
-    const int panel_width_pixels = std::max(1, runtime->right.load() - panel_left);
-    const int panel_height_pixels = std::max(1, runtime->bottom.load() - panel_top);
-    const auto viewport = runtime->viewport.snapshot();
-    const int content_width = std::max(1, viewport.width), content_height = std::max(1, viewport.height);
+    DisplayedPanel panel;
+    {
+        std::lock_guard lock(runtime->panel_geometry_mutex);
+        panel = runtime->displayed_panel;
+    }
+    if (!panel.width || !panel.height) return;
+    const int panel_left = panel.bounds.left, panel_top = panel.bounds.top;
+    const int panel_width_pixels = panel.bounds.right - panel_left, panel_height_pixels = panel.bounds.bottom - panel_top;
+    const int content_width = panel.width, content_height = panel.height;
     const int x = std::clamp(value.value("x", 0), 0, content_width - 1);
     const int y = std::clamp(value.value("y", 0), 0, content_height - 1);
     const int width = std::clamp(value.value("width", 1), 1, content_width);
@@ -772,6 +770,9 @@ bool handle_settings_request(const Json& request) {
             std::string error;
             if (!runtime->settings.save(error)) throw std::runtime_error(error);
         }
+        // 只随偏好快照发送实时显示信息，无需写入用户设置。
+        const int client_height = runtime->client_height_in_viewport_pixels.load();
+        if (client_height > 0) settings["display"] = {{"clientHeightInViewportPixels", client_height}};
         response["result"] = std::move(settings);
     } catch (const std::exception& exception) {
         response["error"] = {{"code", "INVALID_ARGUMENT"}, {"message", exception.what()}};
@@ -886,6 +887,8 @@ void service_loop(std::stop_token stop) {
         shutdown_sent = false;
     };
     auto hidden_since = std::chrono::steady_clock::now();
+    int notified_client_height = 0;
+    auto next_display_update = hidden_since;
     while (!stop.stop_requested()) {
         const auto loop_now = std::chrono::steady_clock::now();
         const bool preload_eligible = runtime->ready.load(std::memory_order_acquire) &&
@@ -957,6 +960,12 @@ void service_loop(std::stop_token stop) {
             shutdown_sent = true; shutdown_tick = GetTickCount64();
         }
         flush_perf_logs();
+        const int client_height = runtime->client_height_in_viewport_pixels.load();
+        if (runtime->connected && client_height > 0 && client_height != notified_client_height &&
+            loop_now >= next_display_update && runtime->channel.send({{"type", "settings_changed"}})) {
+            notified_client_height = client_height;
+            next_display_update = loop_now + std::chrono::milliseconds(200);
+        }
         if (runtime->settings_save_requested.exchange(false)) {
             std::string error;
             if (!runtime->settings.save(error)) api->functions->log_warn("REFF: settings save failed: %s", error.c_str());
@@ -1171,6 +1180,15 @@ void on_present() {
                                                    runtime->viewport.snapshot().generation,
                                                    runtime->panel_resize_edges.load(std::memory_order_acquire) != 0,
                                                    runtime->ready.load() ? &native_previews() : nullptr, runtime->preview_revision.load());
+        {
+            std::lock_guard lock(runtime->panel_geometry_mutex);
+            const auto next = runtime->renderer.displayed_panel();
+            const auto previous = runtime->displayed_panel;
+            runtime->displayed_panel = next;
+            runtime->client_height_in_viewport_pixels = next.client_height_in_viewport_pixels(client_size.second);
+            if (!EqualRect(&previous.bounds, &next.bounds) || previous.width != next.width || previous.height != next.height)
+                request_cursor_sync();
+        }
 #if REFF_ENABLE_PERF_DIAGNOSTICS
         const auto draw_cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - draw_started).count();
         ++runtime->perf_draw_attempts;
@@ -1213,6 +1231,7 @@ void on_reset() {
     compatibility_log("renderer reset");
     runtime->compatibility_renderer_logged = false;
     set_visible(false); std::lock_guard lock(runtime->renderer_mutex); runtime->renderer.reset(); runtime->rendered_frame.reset();
+    std::lock_guard geometry_lock(runtime->panel_geometry_mutex); runtime->displayed_panel = {};
 }
 
 // Windows 消息转换为网页输入；Raw Input/游戏轮询的覆盖范围仍需游戏内验证。

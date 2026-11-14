@@ -9,6 +9,25 @@
 namespace reff {
 template<class T> using Com = Microsoft::WRL::ComPtr<T>;
 
+// 已提交的网页帧在游戏客户区内的实际位置和源图尺寸。外框中的留白不属于网页。
+struct DisplayedPanel {
+    RECT bounds{};
+    int width{}, height{};
+
+    // 折算成网页帧像素，超出纹理上限时也能按游戏画面的实际比例排版。
+    int client_height_in_viewport_pixels(int client_height) const {
+        const int drawn_height = bounds.bottom - bounds.top;
+        return drawn_height > 0 ? MulDiv(client_height, height, drawn_height) : 0;
+    }
+
+    bool map_point(int x, int y, int& page_x, int& page_y) const {
+        if (x < bounds.left || x >= bounds.right || y < bounds.top || y >= bounds.bottom) return false;
+        page_x = (x - bounds.left) * width / (bounds.right - bounds.left);
+        page_y = (y - bounds.top) * height / (bounds.bottom - bounds.top);
+        return true;
+    }
+};
+
 // 游戏 Present 线程独占的 DX12 合成器；通过 fence 判断可重用资源，不逐帧等待 GPU。
 class Renderer {
 public:
@@ -30,7 +49,8 @@ public:
     // 仅由持有 renderer_mutex 的 Present 调用者读取并清零统计窗口。
     Stats take_stats() { auto result = stats_; stats_ = {}; return result; }
     // 只在 Present 线程调用：宿主换代后保留 GPU 资源，但不显示旧会话内容。
-    void invalidate_frame() { sequence_ = 0; uploaded_ = false; }
+    void invalidate_frame() { sequence_ = 0; uploaded_ = false; displayed_panel_ = {}; }
+    DisplayedPanel displayed_panel() const { return displayed_panel_; }
     RECT panel_rect() const;
     // Present 线程转换面板矩形，供窗口线程的浏览器命中与 IME 候选位置共享客户区坐标。
     RECT panel_client_rect(std::pair<int, int> client_size, std::pair<int, int> origin = {-1, -1}) const;
@@ -80,6 +100,7 @@ private:
     UINT cursor_texture_width_{96}, cursor_texture_height_{24};
     std::array<std::pair<int, int>, 4> cursor_hotspots_{};
     Stats stats_{};
+    DisplayedPanel displayed_panel_{};
     HWND window_{};
     std::string last_error_;
 };

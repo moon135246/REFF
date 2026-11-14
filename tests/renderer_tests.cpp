@@ -107,6 +107,38 @@ int main(int argc, char** argv) {
             if(mode!=2 && (count<100*scale*scale || !dark || !bright || minx!=40*scale || miny>50*scale+1 || maxy<72*scale))
                 throw std::runtime_error("Cursor shape, hotspot or outline check failed");
         }
+        // 以客户区坐标检验实际提交给 DX12 的网页帧，包括超限面板与未触限面板。
+        auto draw_panel = [&](int page_width, int page_height, RECT outer) {
+            std::vector<unsigned char> page(page_width * page_height * 4);
+            if (!frame.write(page.data(), page_width, page_height) ||
+                !renderer.draw(frame, {0, 0}, false, {3840, 2160}, {-1, -1}, outer))
+                throw std::runtime_error("hit-test frame submission failed");
+            return renderer.displayed_panel();
+        };
+        int px{}, py{};
+        const auto wilds = draw_panel(1963, 1440, {593, 201, 2556, 1723});
+        if (!wilds.map_point(693, 332, px, py) || px != 100 || py != 90 ||
+            !wilds.map_point(2555, 1681, px, py) || px != 1962 || py != 1439 ||
+            wilds.map_point(693, 241, px, py) || wilds.map_point(693, 1682, px, py))
+            throw std::runtime_error("vertical letterbox hit-test mismatch");
+        const auto wide = draw_panel(2560, 1200, {0, 0, 3000, 1200});
+        if (!wide.map_point(320, 90, px, py) || px != 100 || py != 90 ||
+            wide.map_point(219, 90, px, py) || wide.map_point(2780, 90, px, py))
+            throw std::runtime_error("horizontal letterbox hit-test mismatch");
+        const auto rise = draw_panel(1973, 1196, {40, 60, 2013, 1256});
+        if (!rise.map_point(140, 150, px, py) || px != 100 || py != 90)
+            throw std::runtime_error("unscaled panel hit-test mismatch");
+        for (const auto [w, h] : {std::pair{1920, 1080}, {2560, 1440}, {3840, 2160}, {3440, 1440}}) {
+            const int fw = std::min(w, frame_max_width);
+            const int fh = std::min(h, frame_max_height);
+            const auto panel = draw_panel(fw, fh, {0, 0, w, h});
+            if (!panel.map_point(w / 2, h / 2, px, py) || std::abs(px - fw / 2) > 1 || std::abs(py - fh / 2) > 1 ||
+                std::abs(panel.client_height_in_viewport_pixels(h) * (panel.bounds.bottom - panel.bounds.top) / double(fh) - h) > 1)
+                throw std::runtime_error("resolution-dependent input or display scale mismatch");
+        }
+        renderer.invalidate_frame();
+        if (renderer.displayed_panel().map_point(140, 150, px, py))
+            throw std::runtime_error("discarded frame still accepts input");
         renderer.reset(); DestroyWindow(window); return 0;
     } catch (const std::exception& error) { if(window) DestroyWindow(window); std::cerr<<error.what()<<'\n'; return 1; }
 }

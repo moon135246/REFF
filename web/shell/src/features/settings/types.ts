@@ -1,7 +1,8 @@
-import type { ReffAppearance, ReffLanguage } from '@reff/ui';
+import type { ReffAppearance, ReffLanguage, ReffPreferences } from '@reff/ui';
 
 export type ReffSettings = {
   schemaVersion: 1;
+  display?: ReffPreferences['display'];
   language: ReffLanguage;
   hotkey: { key: number; modifiers: number };
   appearance: ReffAppearance;
