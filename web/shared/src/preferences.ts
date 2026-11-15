@@ -14,6 +14,7 @@ export type ReffAppearance = {
 export type ReffPreferences = {
   language: ReffLanguage;
   appearance: ReffAppearance;
+  display?: { clientHeightInViewportPixels: number };
 };
 
 const colorPattern = /^#[0-9a-f]{6}$/i;
